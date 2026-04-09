@@ -215,26 +215,50 @@ def build_heightfield(obj):
     z_all = v_world[:, 2]
 
     # ── Detect bimodal structure (base slab + caustic surface) ─────
+    # Uses gap-based detection: sort Z values, find largest gap.
+    # If gap is >10x the mean gap, the mesh has two distinct Z layers.
     z_min, z_max = z_all.min(), z_all.max()
     z_range = z_max - z_min
 
     if z_range < 1e-9:
         raise ValueError("Mesh has zero Z relief — not a valid caustic surface")
 
-    z_mid = (z_min + z_max) / 2.0
-    lower_count = (z_all < z_mid).sum()
-    upper_count = (z_all >= z_mid).sum()
-    gap_fraction = abs(lower_count - upper_count) / vcount
+    bimodal = False
+    z_sorted = np.sort(z_all)
+    z_diffs = np.diff(z_sorted)
+    max_gap_idx = int(np.argmax(z_diffs))
+    max_gap = z_diffs[max_gap_idx]
+    mean_gap = np.mean(z_diffs)
 
-    bimodal = (gap_fraction < 0.05)
+    if mean_gap > 0 and max_gap > mean_gap * 10:
+        # Large gap found — likely bimodal
+        split_z = (z_sorted[max_gap_idx] + z_sorted[max_gap_idx + 1]) / 2.0
+        upper_mask = z_all >= split_z
+        lower_mask = ~upper_mask
+        n_upper = int(upper_mask.sum())
+        n_lower = int(lower_mask.sum())
 
-    if bimodal:
-        upper_mask = z_all >= z_mid
-        caustic_verts = v_world[upper_mask]
-        lower_z = z_all[~upper_mask]
-        lower_std = lower_z.std()
-        if lower_std < z_range * 0.001:
-            pass
+        # The caustic surface is the layer whose count is closest to a perfect square
+        # (the slab may have slightly different count due to OBJ import artifacts)
+        gs_upper = int(round(math.sqrt(n_upper)))
+        gs_lower = int(round(math.sqrt(n_lower)))
+        err_upper = abs(gs_upper * gs_upper - n_upper)
+        err_lower = abs(gs_lower * gs_lower - n_lower)
+
+        # Pick whichever layer is closer to a square grid — that's the structured one
+        # Caustic surface is typically the upper layer (higher Z)
+        if err_upper <= gs_upper:
+            caustic_verts = v_world[upper_mask]
+            bimodal = True
+        elif err_lower <= gs_lower:
+            # Upper layer is the caustic but has bad count — try lower as slab check
+            # If lower is the flat slab, use upper regardless
+            lower_z = z_all[lower_mask]
+            if lower_z.std() < z_range * 0.1:
+                caustic_verts = v_world[upper_mask]
+                bimodal = True
+            else:
+                caustic_verts = v_world
         else:
             caustic_verts = v_world
     else:
@@ -243,13 +267,36 @@ def build_heightfield(obj):
     # ── Build grid ────────────────────────────────────────────────
     n_caustic = len(caustic_verts)
     grid_size = int(round(math.sqrt(n_caustic)))
+    expected = grid_size * grid_size
 
-    if abs(grid_size * grid_size - n_caustic) > grid_size:
-        raise ValueError(f"Caustic surface ({n_caustic} verts) is not a square grid")
+    if abs(expected - n_caustic) > grid_size:
+        raise ValueError(f"Caustic surface ({n_caustic} verts) is not a square grid "
+                         f"(nearest: {grid_size}x{grid_size}={expected})")
 
+    # Sort verts into grid order: ascending Y, then ascending X within each row
+    # This handles OBJ imports that may not preserve vertex order
     cx = caustic_verts[:, 0]
     cy = caustic_verts[:, 1]
     cz = caustic_verts[:, 2]
+
+    # Sort by Y first (row), then X (column) — lexicographic on (Y, X)
+    sort_idx = np.lexsort((cx, cy))
+    cx = cx[sort_idx]
+    cy = cy[sort_idx]
+    cz = cz[sort_idx]
+
+    # Handle slight vert count mismatch (±few from OBJ import)
+    if n_caustic < expected:
+        # Pad by duplicating the last vertex
+        pad_n = expected - n_caustic
+        cx = np.concatenate([cx, np.full(pad_n, cx[-1])])
+        cy = np.concatenate([cy, np.full(pad_n, cy[-1])])
+        cz = np.concatenate([cz, np.full(pad_n, cz[-1])])
+    elif n_caustic > expected:
+        # Trim extras (likely duplicate verts at boundaries)
+        cx = cx[:expected]
+        cy = cy[:expected]
+        cz = cz[:expected]
 
     x_min_m, x_max_m = cx.min(), cx.max()
     y_min_m, y_max_m = cy.min(), cy.max()

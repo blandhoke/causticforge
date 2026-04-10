@@ -1,0 +1,1 @@
+/Users/admin/Documents/Claude/BlenderAddons/causticforge/causticforge_v1.py

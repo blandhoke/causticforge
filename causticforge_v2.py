@@ -508,7 +508,7 @@ def gen_roughing(props, obj, z_grid, meta):
     - Surface-following floor: every sample clamps to (surface + skin)
       so the finish pass always removes a uniform skin depth
     - Stops at (cut_depth - stock_to_leave) — never touches final surface
-    - Edge-entry only — no plunges into stock
+    - No-lift raster: rows stay within stock bounds, stepover without lifting
     - Along-path at 4x finer than stepover for accurate floor following
     """
     sw = props.stock_width;  sh = props.stock_height
@@ -537,7 +537,7 @@ def gen_roughing(props, obj, z_grid, meta):
         z -= doc
     if not z_levels or z_levels[-1] > rough_floor + 1e-6:
         z_levels.append(round(rough_floor, 4))
-    z_levels = sorted(set(z_levels))
+    z_levels = sorted(set(z_levels), reverse=True)
 
     y_rows = []
     y = 0.0
@@ -556,7 +556,7 @@ def gen_roughing(props, obj, z_grid, meta):
         f"(Skin left for finish: {stl:.4f}\"  Rough floor: {rough_floor:.4f}\")",
         f"(Feed: {feed:.1f} IPM  Plunge: {plunge:.1f} IPM  RPM: {rpm})",
         f"(Speed mode: {props.speed_mode}  Z levels: {len(z_levels)}  Y rows/level: {len(y_rows)})",
-        "(Edge-entry only — no plunges into stock)",
+        "(No-lift raster — edge-entry overshoot, no lift between rows)",
         f"M03 S{rpm}",
         g1(z=safe_z, f=rapid),
     ]
@@ -564,12 +564,17 @@ def gen_roughing(props, obj, z_grid, meta):
     direction = 1
     for z_lv in z_levels:
         lines += ["", f"(--- Z level {z_lv:.4f}\" ---)"]
-        for y_pos in y_rows:
+        for yi, y_pos in enumerate(y_rows):
             x_start = -overshoot   if direction == 1 else sw + overshoot
             x_end   = sw+overshoot if direction == 1 else -overshoot
 
-            lines.append(g1(x=x_start, y=y_pos, f=rapid, comment=f"row Y={y_pos:.3f}"))
-            lines.append(g1(z=z_lv, f=plunge, comment="entry plunge (outside stock)"))
+            if yi == 0:
+                # First row per Z level: rapid to start, plunge outside stock
+                lines.append(g1(x=x_start, y=y_pos, f=rapid, comment=f"row Y={y_pos:.3f}"))
+                lines.append(g1(z=z_lv, f=plunge, comment="entry plunge (outside stock)"))
+            else:
+                # Step over to next row at cutting depth (no lift)
+                lines.append(g1(x=x_start, y=y_pos, f=feed, comment=f"stepover Y={y_pos:.3f}"))
 
             for si in range(N_X + 1):
                 t     = si / N_X
@@ -587,8 +592,10 @@ def gen_roughing(props, obj, z_grid, meta):
                 f_use = plunge if dz < -0.005 else feed
                 lines.append(g1(x=x_pos, y=y_pos, z=cut_z, f=f_use))
 
-            lines.append(g1(z=safe_z, f=rapid, comment="lift"))
             direction *= -1
+
+        # Lift after all rows in this Z level complete
+        lines.append(g1(z=safe_z, f=rapid, comment="lift"))
 
     lines += ["", "(=== ROUGHING COMPLETE ===)", ""]
     return lines
@@ -847,7 +854,7 @@ def gen_squarecut(props):
         z -= doc
     if not z_levels or z_levels[-1] > -depth + 1e-6:
         z_levels.append(round(-depth, 4))
-    z_levels = sorted(set(z_levels))
+    z_levels = sorted(set(z_levels), reverse=True)
 
     # Tab positions (midpoint of each side, in tool-center coordinates)
     tabs = []

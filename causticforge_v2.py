@@ -493,6 +493,8 @@ def gcode_header_squarecut(filename, props):
         f"(Machine: Blue Elephant 1325 / NK105  F on every G01  no G00)",
         "(Zero: front-left corner of square, Z=0 at stock top)",
         "G54", "G20", "G17 G90",
+        "",
+        g1(z=props.sq_safe_height, f=props.sq_rapid, comment="retract before spindle on"),
     ]
     return lines
 
@@ -878,7 +880,6 @@ def gen_squarecut(props):
     lines = [
         "",
         f"M03 S{rpm}",
-        g1(z=safe_z, f=rapid),
     ]
 
     def _in_tab(side, pos, z_lv):
@@ -892,58 +893,64 @@ def gen_squarecut(props):
                     return t['tab_z']
         return None
 
+    def _emit_edge(side, points_iter, fixed_axis, fixed_val, z_lv, prev_z):
+        """Emit G1 moves for one side. Uses plunge feed for Z- moves after tabs (Option A)."""
+        edge_lines = []
+        cur_z = prev_z
+        for pos in points_iter:
+            tz = _in_tab(side, pos, z_lv)
+            z_use = tz if tz is not None else z_lv
+            # Use plunge feed for Z- moves re-entering cut after a tab
+            f_use = plunge if z_use < cur_z - 1e-6 else feed
+            if fixed_axis == 'x':
+                edge_lines.append(g1(x=pos, y=round(fixed_val, 4), z=z_use, f=f_use))
+            else:
+                edge_lines.append(g1(x=round(fixed_val, 4), y=pos, z=z_use, f=f_use))
+            cur_z = z_use
+        return edge_lines, cur_z
+
+    # CW rectangle: bottom(+X) -> right(+Y) -> top(-X) -> left(-Y)
+    n_seg = max(20, int(max(w, h) / 0.050))
+
     # Start at bottom-left corner
+    lines.append(g1(x=round(x_min, 4), y=round(y_min, 4), f=rapid))
+
     for z_idx, z_lv in enumerate(z_levels):
         lines.append("")
         lines.append(f"(--- Z level {z_lv:.4f}\" ---)")
 
-        # Move to start (bottom-left)
-        lines.append(g1(x=round(x_min, 4), y=round(y_min, 4), f=rapid))
-
-        if z_idx == 0:
-            lines.append(g1(z=round(z_lv + 0.050, 4), f=rapid))
+        # Plunge to next level (already at start corner from previous layer or initial rapid)
         lines.append(g1(z=z_lv, f=plunge, comment="plunge"))
 
-        # CW rectangle: bottom(+X) -> right(+Y) -> top(-X) -> left(-Y)
-        # Number of sample points per side for tab detection
-        n_seg = max(20, int(max(w, h) / 0.050))
+        cur_z = z_lv
 
         # Bottom edge: x_min -> x_max at y_min
-        for i in range(1, n_seg + 1):
-            xp = round(x_min + (x_max - x_min) * i / n_seg, 4)
-            # Map tool center back to stock coordinate for tab check
-            stock_x = xp + bit_r  # approximate stock X
-            tz = _in_tab('bottom', stock_x - bit_r, z_lv)  # use midpoint of square
-            # Actually tab center is at w/2 in stock coords, tool is at x along offset path
-            tz = _in_tab('bottom', xp, z_lv)
-            z_use = tz if tz is not None else z_lv
-            lines.append(g1(x=xp, y=round(y_min, 4), z=z_use, f=feed))
+        pts = [round(x_min + (x_max - x_min) * i / n_seg, 4) for i in range(1, n_seg + 1)]
+        edge, cur_z = _emit_edge('bottom', pts, 'x', y_min, z_lv, cur_z)
+        lines.extend(edge)
 
         # Right edge: y_min -> y_max at x_max
-        for i in range(1, n_seg + 1):
-            yp = round(y_min + (y_max - y_min) * i / n_seg, 4)
-            tz = _in_tab('right', yp, z_lv)
-            z_use = tz if tz is not None else z_lv
-            lines.append(g1(x=round(x_max, 4), y=yp, z=z_use, f=feed))
+        pts = [round(y_min + (y_max - y_min) * i / n_seg, 4) for i in range(1, n_seg + 1)]
+        edge, cur_z = _emit_edge('right', pts, 'y', x_max, z_lv, cur_z)
+        lines.extend(edge)
 
         # Top edge: x_max -> x_min at y_max
-        for i in range(1, n_seg + 1):
-            xp = round(x_max - (x_max - x_min) * i / n_seg, 4)
-            tz = _in_tab('top', xp, z_lv)
-            z_use = tz if tz is not None else z_lv
-            lines.append(g1(x=xp, y=round(y_max, 4), z=z_use, f=feed))
+        pts = [round(x_max - (x_max - x_min) * i / n_seg, 4) for i in range(1, n_seg + 1)]
+        edge, cur_z = _emit_edge('top', pts, 'x', y_max, z_lv, cur_z)
+        lines.extend(edge)
 
         # Left edge: y_max -> y_min at x_min
-        for i in range(1, n_seg + 1):
-            yp = round(y_max - (y_max - y_min) * i / n_seg, 4)
-            tz = _in_tab('left', yp, z_lv)
-            z_use = tz if tz is not None else z_lv
-            lines.append(g1(x=round(x_min, 4), y=yp, z=z_use, f=feed))
+        pts = [round(y_max - (y_max - y_min) * i / n_seg, 4) for i in range(1, n_seg + 1)]
+        edge, cur_z = _emit_edge('left', pts, 'y', x_min, z_lv, cur_z)
+        lines.extend(edge)
 
-        lines.append(g1(z=safe_z, f=rapid, comment="lift"))
+        # Perimeter closes at (x_min, y_min) — same as start corner. No lift needed.
+
+    # Retract only after final layer
+    lines.append(g1(z=safe_z, f=rapid, comment="lift"))
 
     lines.append("")
-    lines.append(f"(Square cut complete: {len(z_levels)} Z levels)")
+    lines.append(f"(Square cut complete: {len(z_levels)} Z levels, no retract between layers)")
     lines.append("(=== SQUARE CUT COMPLETE ===)")
 
     return lines
